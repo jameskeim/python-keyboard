@@ -20,12 +20,16 @@ from .action_code import *
 # fmt: off
 KEY_NAME =  (
     'ESC', '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', 'BACKSPACE',
-    '|', ']', '[', 'P', 'O', 'I', 'U', 'Y', 'T', 'R', 'E', 'W', 'Q', 'TAB', 'CAPS',
+    'CAPS', 'TAB', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '[', ']', '|',
     'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ';', '"', 'ENTER',
-    'RSHIFT', '/', '.', ',', 'M', 'N', 'B', 'V', 'C', 'X', 'Z', 'LSHIFT',
+    'LSHIFT', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', ',', '.', '/', 'RSHIFT',
     'LCTRL', 'LGUI', 'LALT', 'SPACE', 'RALT', 'MENU', 'FN', 'RCTRL'
 )
 # fmt: on
+
+
+def key_name(key):
+    return KEY_NAME[COORDS[key]]
 
 
 @micropython.asm_thumb
@@ -105,11 +109,12 @@ class Keyboard:
         self._connection = ""
         self.adv_timeout = None
 
-        self.data = array.array("L", microcontroller.nvm[:272])
+        size = 4 + self.matrix.keys
+        self.data = array.array("L", microcontroller.nvm[: size * 4])
         if self.data[0] != 0x424B5950:
             self.data[0] = 0x424B5950
             self.data[1] = 1
-            for i in range(4, 68):
+            for i in range(4, size):
                 self.data[i] = 0
         self.ble_id = self.data[1]
         self.heatmap = memoryview(self.data)[4:]
@@ -121,9 +126,11 @@ class Keyboard:
         self.advertisement = ProvideServicesAdvertisement(ble_hid, self.battery)
         self.advertisement.appearance = 961
         self.ble = adafruit_ble.BLERadio()
-        self.change_bt(self.ble_id)
+        self.set_bt_id(self.ble_id)
         self.ble_hid = HID(ble_hid.devices)
         self.usb_hid = HID(usb_hid.devices)
+        if not usb_is_connected():
+            self.change_bt(self.ble_id)
 
     def update_connection(self):
         if usb_is_connected() and self.usb_status == 3:
@@ -157,28 +164,24 @@ class Keyboard:
             elif time.time() > self.adv_timeout:
                 self.stop_advertising()
 
-        leds = None
         if usb_is_connected():
             if self.usb_status == 0:
                 self.usb_status = 3
-            elif self.usb_status == 3:
-                leds = self.usb_hid.leds
+                self.update_connection()
         elif self.usb_status > 0:
             self.usb_status = 0
-            if not self.ble._adapter.advertising:
+            self.update_connection()
+            if not self.ble.connected and not self.ble._adapter.advertising:
                 self.start_advertising()
 
-        if leds is None:
-            leds = self.ble_hid.leds if self.ble.connected else 0
-        if leds != self.leds:
-            self.leds = leds
-            self.backlight.set_hid_leds(leds)
-            self.log("keyboard leds {}".format(bin(leds)))
-        self.update_connection()
+        if self.usb_status == 3:
+            self.backlight.set_hid_leds(self.usb_hid.leds)
+        elif self.ble.connected:
+            self.backlight.set_hid_leds(self.ble_hid.leds)
 
         # update battery level
         if time.time() > self.battery_update_time:
-            self.battery_update_time = time.time() + 360
+            self.battery_update_time = time.time() + 3600
             self.battery.level = battery_level()
 
     def setup(self):
@@ -213,7 +216,7 @@ class Keyboard:
         matrix = self.matrix
         event = matrix.view(start - 1)
         key = event & 0x7F
-        desc = KEY_NAME[key]
+        desc = key_name(key)
         if event < 0x80:
             desc += " \\ "
             t0 = matrix.get_keydown_time(key)
@@ -225,7 +228,7 @@ class Keyboard:
         for i in range(start, end):
             event = matrix.view(i)
             key = event & 0x7F
-            desc += KEY_NAME[key]
+            desc += key_name(key)
             if event < 0x80:
                 desc += " \\ "
                 t1 = matrix.get_keydown_time(key)
@@ -290,7 +293,10 @@ class Keyboard:
 
         return False
 
-    def change_bt(self, n):
+    def set_bt_id(self, n):
+        if 0 > n or n > 9:
+            n = 0
+
         if self.ble.connected:
             try:
                 self.ble_hid.release_all()
@@ -300,9 +306,6 @@ class Keyboard:
                 c.disconnect()
         if self.ble._adapter.advertising:
             self.ble.stop_advertising()
-
-        if 0 > n or n > 9:
-            return
 
         uid = self.uid[n : n + 6]
         uid[-1] = uid[-1] | 0xC0
@@ -320,9 +323,18 @@ class Keyboard:
             print(e)
         self.log(self.ble._adapter.address)
 
-        self.start_advertising()
+    def change_bt(self, n):
+        if self.usb_status == 3:
+            self.usb_status = 1
+        if n != self.ble_id:
+            self.set_bt_id(n)
+            self.start_advertising()
+        elif not self.ble.connected and not self.ble._adapter.advertising:
+            self.start_advertising()
+        self.update_connection()
 
     def toggle_bt(self):
+        bt_is_off = True
         if self.ble.connected:
             try:
                 self.ble_hid.release_all()
@@ -334,6 +346,13 @@ class Keyboard:
             self.stop_advertising()
         else:
             self.start_advertising()
+            bt_is_off = False
+        if bt_is_off:
+            if self.usb_status == 1:
+                self.usb_status = 3
+        else:
+            if self.usb_status == 3:
+                self.usb_status = 1
         self.update_connection()
 
     def toggle_usb(self):
@@ -371,12 +390,7 @@ class Keyboard:
         try:
             if self.usb_status == 0x3 and usb_is_connected():
                 self.usb_hid.press(*keycodes)
-                return
-        except Exception as e:
-            print(e)
-
-        try:
-            if self.ble.connected:
+            elif self.ble.connected:
                 self.ble_hid.press(*keycodes)
             elif not self.ble._adapter.advertising:
                 self.start_advertising()
@@ -387,12 +401,7 @@ class Keyboard:
         try:
             if self.usb_status == 0x3 and usb_is_connected():
                 self.usb_hid.release(*keycodes)
-                return
-        except Exception as e:
-            print(e)
-
-        try:
-            if self.ble.connected:
+            elif self.ble.connected:
                 self.ble_hid.release(*keycodes)
         except Exception as e:
             print(e)
@@ -401,13 +410,35 @@ class Keyboard:
         try:
             if self.usb_status == 0x3 and usb_is_connected():
                 self.usb_hid.send_consumer(keycode)
-                return
+            elif self.ble.connected:
+                self.ble_hid.send_consumer(keycode)
         except Exception as e:
             print(e)
 
+    def press_mouse(self, buttons):
         try:
-            if self.ble.connected:
-                self.ble_hid.send_consumer(keycode)
+            if self.usb_status == 0x3 and usb_is_connected():
+                self.usb_hid.press_mouse(buttons)
+            elif self.ble.connected:
+                self.ble_hid.press_mouse(buttons)
+        except Exception as e:
+            print(e)
+
+    def release_mouse(self, buttons):
+        try:
+            if self.usb_status == 0x3 and usb_is_connected():
+                self.usb_hid.release_mouse(buttons)
+            elif self.ble.connected:
+                self.ble_hid.release_mouse(buttons)
+        except Exception as e:
+            print(e)
+
+    def move_mouse(self, x=0, y=0, wheel=0):
+        try:
+            if self.usb_status == 0x3 and usb_is_connected():
+                self.usb_hid.move_mouse(x, y, wheel)
+            elif self.ble.connected:
+                self.ble_hid.move_mouse(x, y, wheel)
         except Exception as e:
             print(e)
 
@@ -428,37 +459,38 @@ class Keyboard:
         keys = [0] * matrix.keys
         ms = matrix.ms
         last_time = 0
+        mouse_action = 0
+        mouse_time = 0
         while True:
-            t = 20 if self.backlight.check() else 1000
+            t = 20 if self.backlight.check() or mouse_action else 1000
             n = matrix.wait(t)
             self.check()
-            if n == 0:
-                continue
 
-            # detecting pair keys
-            if n == 1:
-                key = matrix.view(0)
-                if key < 0x80 and key in self.pair_keys:
-                    n = matrix.wait(
-                        self.pair_delay
-                        - ms(matrix.time() - matrix.get_keydown_time(key))
-                    )
+            if self.pair_keys:
+                # detecting pair keys
+                if n == 1:
+                    key = matrix.view(0)
+                    if key < 0x80 and key in self.pair_keys:
+                        n = matrix.wait(
+                            self.pair_delay
+                            - ms(matrix.time() - matrix.get_keydown_time(key))
+                        )
 
-            if n >= 2:
-                pair = {matrix.view(0), matrix.view(1)}
-                if pair in self.pairs:
-                    pair_index = self.pairs.index(pair)
-                    key1 = self.get()
-                    key2 = self.get()
+                if n >= 2:
+                    pair = {matrix.view(0), matrix.view(1)}
+                    if pair in self.pairs:
+                        pair_index = self.pairs.index(pair)
+                        key1 = self.get()
+                        key2 = self.get()
 
-                    dt = ms(
-                        matrix.get_keydown_time(key2) - matrix.get_keydown_time(key1)
-                    )
-                    log("pair keys {} {}, dt = {}".format(pair_index, pair, dt))
-                    try:
-                        self.pairs_handler(dev, pair_index)
-                    except Exception as e:
-                        print(e)
+                        dt = ms(
+                            matrix.get_keydown_time(key2) - matrix.get_keydown_time(key1)
+                        )
+                        log("pair keys {} {}, dt = {}".format(pair_index, pair, dt))
+                        try:
+                            self.pairs_handler(dev, pair_index)
+                        except Exception as e:
+                            print(e)
 
             while len(matrix):
                 event = self.get()
@@ -491,8 +523,11 @@ class Keyboard:
                             if action_code & 0x400:
                                 self.send_consumer(action_code & 0x3FF)
                         elif kind == ACT_MOUSEKEY:
-                            # todo
-                            pass
+                            if action_code & 0xF00 == 0:
+                                self.press_mouse(action_code & 0xF)
+                            else:
+                                mouse_action = (action_code >> 8) & 0xF
+                                mouse_time = time.monotonic_ns()
                         elif kind == ACT_LAYER_TAP or kind == ACT_LAYER_TAP_EXT:
                             layer = (action_code >> 8) & 0x1F
                             mask = 1 << layer
@@ -571,7 +606,7 @@ class Keyboard:
                         last_time = keydown_time
                         print(
                             "{} {} \\ {} latency {} | {}".format(
-                                key, KEY_NAME[key], hex(action_code), dt, dt2
+                                key, key_name(key), hex(action_code), dt, dt2
                             )
                         )
                 else:
@@ -595,7 +630,11 @@ class Keyboard:
                             if action_code & 0x400:
                                 self.send_consumer(0)
                         elif kind == ACT_MOUSEKEY:
-                            pass
+                            if action_code & 0xF00 == 0:
+                                self.release_mouse(action_code & 0xF)
+                            elif (action_code >> 8) & 0xF == mouse_action:
+                                mouse_action = 0
+                                self.move_mouse(0, 0, 0)
                         elif kind == ACT_LAYER_TAP or kind == ACT_LAYER_TAP_EXT:
                             layer = (action_code >> 8) & 0x1F
                             keycode = action_code & 0xFF
@@ -620,6 +659,12 @@ class Keyboard:
                         last_time = keyup_time
                         print(
                             "{} {} / {} latency {} | {}".format(
-                                key, KEY_NAME[key], hex(action_code), dt, dt2
+                                key, key_name(key), hex(action_code), dt, dt2
                             )
                         )
+
+            if mouse_action:
+                x, y, wheel = MS_MOVEMENT[mouse_action]
+                dt = 1 + (time.monotonic_ns() - mouse_time) // 8000000
+                mouse_time = time.monotonic_ns()
+                self.move_mouse(x * dt, y * dt, wheel * dt)

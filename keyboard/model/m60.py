@@ -165,10 +165,11 @@ class Backlight:
             self.broadcast,
             self.blackhole,
             self.pinwheel,
+            self.beacon,
+            self.beacon2
         )
-        self.mode = 6
-        self.mode_function = self.modes[self.mode]
-        self.dynamic = True
+        self.set_mode(6)
+        self.enabled = False
 
     @property
     def hue(self):
@@ -177,8 +178,7 @@ class Backlight:
     @hue.setter
     def hue(self, h):
         self.hsv[0] = h & 0xFF
-        if not self.dynamic:
-            self.mode_function()
+        self.refresh()
 
     @property
     def sat(self):
@@ -187,8 +187,7 @@ class Backlight:
     @sat.setter
     def sat(self, s):
         self.hsv[1] = 0 if s < 0 else (255 if s > 255 else s)
-        if not self.dynamic:
-            self.mode_function()
+        self.refresh()
 
     @property
     def val(self):
@@ -284,8 +283,36 @@ class Backlight:
         self.n = (n + 2) & 0xFF
         return True
 
+    def beacon(self):
+        n = self.n
+        for i in range(63):
+            offset = (angle[i] + n) & 0xFF
+            if offset < 64:
+                offset <<= 2
+            else:
+                offset = 0
+            self.pixel(i, *wheel(offset))
+        self.update()
+        self.n = (n + 2) & 0xFF
+        return True
+
+    def beacon2(self):
+        n = self.n
+        for i in range(63):
+            offset = (angle[i] + n) & 0xFF
+            if offset < 64:
+                offset <<= 2
+            elif 128 < offset and offset < 192:
+                offset = (offset - 128) << 2
+            else:
+                offset = 0
+            self.pixel(i, *wheel(offset))
+        self.update()
+        self.n = (n + 2) & 0xFF
+        return True
+
     def handle_key(self, key, pressed):
-        if self.enabled and self.mode == 6:
+        if pressed and self.enabled and self.mode == 6:
             self.keys[key] = 255
 
     def elapse(self):
@@ -294,67 +321,51 @@ class Backlight:
         for i in self.keys.keys():
             t = self.keys[i]
             self.pixel(i, *wheel2(255 - t, t))
-            t -= 1
-            if t < 0:
-                self.keys.pop(i)
+            if t >= 4:
+                self.keys[i] = t - 4
+            elif t > 0:
+                self.keys[i] = t - 1
             else:
-                self.keys[i] = t
+                self.keys.pop(i)
         self.update()
         return True
 
     def set_hid_leds(self, v):
-        self._hid_leds = v
-        if self._hid_leds & 2:
-            # capslock
-            self.dev.update_pixel(28, 0, 0x80, 0)
-        else:
-            self.dev.update_pixel(28, 0, 0, 0)
-            self.mode_function()
+        if self._hid_leds != v:
+            self._hid_leds = v
+            g = 128 if (self._hid_leds & 2) else 0
+            self.dev.update_pixel(28, 0, g, 0)
+            self.refresh()
 
     def set_bt_led(self, v):
-        if self._bt_led is not None:
-            self.dev.breathing_pixel(self._bt_led, 0)
         if v == 0:
             v = 10
-        self._bt_led = v
         if v is not None:
-            self.dev.breathing_pixel(v, 2)
-        elif (self._hid_leds & 2) == 0 and not self.dev.any():
-            self.dev.power.value = 0
+            self.dev.set_mode(v, 2)
+        if self._bt_led is not None:
+            self.dev.set_mode(self._bt_led, 0)
+        self._bt_led = v
 
     def update(self):
-        in_use = False
         if self._hid_leds & 2:
             self.pixel(28, 0, 0x80, 0)
-            in_use = True
-        if self._bt_led:
-            self.pixel(self._bt_led, 0, 0, 0)
-            in_use = True
-        self.pixel(63, 0, 0, 0)
         self.dev.update()
-        if not in_use and not self.dev.any():
-            self.dev.power.value = 0
 
     def check(self):
         if self.enabled and self.dynamic:
             return self.mode_function()
         return False
 
-    def next(self):
-        self.dev.clear()
-        self.mode += 1
-        if self.mode >= len(self.modes):
-            self.mode = 0
-        self.mode_function = self.modes[self.mode]
-        if self.mode == 6:
-            self.keys.clear()
-        if self.mode >= 3:
-            self.dynamic = True
-        else:
-            self.dynamic = False
+    def refresh(self):
+        if self.enabled and not self.dynamic:
             self.mode_function()
 
+    def next(self):
+        self.set_mode(self.mode + 1)
+
     def set_mode(self, mode):
+        self.enabled = True
+        self.dev.clear()
         self.mode = mode if mode < len(self.modes) else 0
         self.mode_function = self.modes[self.mode]
         if self.mode == 6:
